@@ -1,0 +1,135 @@
+name: publish
+on:
+  push:
+    branches:
+      - 'main'
+  pull_request:
+    branches:
+      - '*'
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  DOTNET_NOLOGO: true
+  NuGetDirectory: ${{ github.workspace}}/nuget
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  create_nuget:
+    runs-on: ubuntu-20.04
+    steps:
+    - uses: actions/checkout@v3
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@v2
+    - run: dotnet run --project src/ListDotNetTypes/ListDotNetTypes.csproj -- src/Meziantou.Analyzer/Resources/
+    - run: |
+        $(Invoke-WebRequest "https://www.nuget.org/api/v2/package/Meziantou.Analyzer/").BaseResponse.RequestMessage.RequestUri -match "meziantou\.analyzer\.1\.0\.([0-9]+).nupkg$"
+        $NewVersion = "1.0.$([int]$Matches.1 + 1)"
+        Write-Host "New version: $NewVersion"
+        Write-Host "::set-output name=package_version::$NewVersion"
+      name: Compute version
+      id: compute-version
+    - run: dotnet pack src/Meziantou.Analyzer/Meziantou.Analyzer.csproj --configuration Release /p:PackageId=Meziantou.Analyzer /p:PackageVersion=${{ steps.compute-version.outputs.package_version }} /p:RoslynVersion=minimal /p:RepositoryBranch="${{github.ref}}" /bl
+    - uses: actions/upload-artifact@v3
+      with:
+        name: nuget
+        if-no-files-found: error
+        retention-days: 3
+        path: '**/*.nupkg'
+    - uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: binlog
+        if-no-files-found: error
+        retention-days: 3
+        path: '**/*.binlog'
+
+  validate_nuget:
+    runs-on: windows-2022
+    needs: [ create_nuget ]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup .NET Core (global.json)
+        uses: actions/setup-dotnet@v2
+      - uses: actions/download-artifact@v3
+        with:
+          name: nuget
+          path: ${{ env.NuGetDirectory }}
+      - name: Run dotnet validate
+        run: |
+          dotnet tool update Meziantou.Framework.NuGetPackageValidation.Tool --global
+          $files = Get-ChildItem "${{ env.NuGetDirectory }}/*" -Recurse -Include *.nupkg
+          $Errors = $false
+          foreach($file in $files) {
+              & meziantou.validate-nuget-package "$file"
+              if ($LASTEXITCODE -ne 0) {
+                $Errors = $true
+              }
+          }
+          if ($Errors) {
+            exit 1
+          }
+
+  build_and_test:
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      TestResultsDirectory: ${{ github.workspace}}/TestResults
+    strategy:
+      matrix:
+        runs-on: [ ubuntu-20.04, windows-2019 ]
+        configuration: [ Debug, Release ]
+        roslyn-version: [ 'minimal', 'latest', 'preview' ]
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v3
+    - name: Setup .NET Core (global.json)
+      uses: actions/setup-dotnet@v2
+    - name: Setup .NET Core (3.1)
+      uses: actions/setup-dotnet@v2
+      with:
+        dotnet-version: '3.1.x'
+    - run: dotnet test --configuration ${{ matrix.configuration }} --logger trx --logger "GitHubActions;report-warnings=false" --collect:"XPlat Code Coverage" --blame-hang --blame-hang-timeout 2min --results-directory "${{ env.TestResultsDirectory }}" /p:WarningsAsErrors=true /p:RoslynVersion=${{ matrix.roslyn-version}}
+      name: Run tests
+    - uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-${{ matrix.runs-on }}-${{ matrix.configuration }}
+        if-no-files-found: error
+        retention-days: 3
+        path: ${{ env.TestResultsDirectory }}/**/*
+    - uses: codecov/codecov-action@v3
+
+  deploy:
+    runs-on: 'ubuntu-20.04'
+    needs: [ validate_nuget, build_and_test ]
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 2
+    - uses: actions/download-artifact@v3
+      with:
+        name: nuget
+        path: ${{ env.NuGetDirectory }}
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@v2
+    - run: |
+        Write-Host "Current ref: $env:GITHUB_REF"
+        Write-Host "Searching nupkg in folder: ${{ env.NuGetDirectory }}"
+        $files = Get-ChildItem "${{ env.NuGetDirectory }}/*" -Recurse -Include *.nupkg
+        foreach($file in $files) {
+            Write-Host "Pushing NuGet package: $($file.FullName)"
+            if ($env:GITHUB_REF -eq 'refs/heads/main')
+            {
+              & dotnet nuget push "$($file.FullName)" --api-key "$env:NuGetApiKey" --source https://api.nuget.org/v3/index.json --force-english-output --skip-duplicate
+            }
+            else
+            {
+              Write-Host "Not on the default branch => Do not push"
+            }
+        }
+      name: Publish NuGet packages
+      if: always()
+      env:
+        NuGetApiKey: ${{ secrets.NuGetApiKey }}
